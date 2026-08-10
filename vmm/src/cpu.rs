@@ -504,7 +504,6 @@ pub struct Vcpu {
     // The hypervisor abstracted CPU.
     vcpu: Box<dyn hypervisor::Vcpu>,
     id: u32,
-    saved_state: Option<CpuState>,
     #[cfg(target_arch = "x86_64")]
     vendor: CpuVendor,
 }
@@ -532,7 +531,6 @@ impl Vcpu {
         Ok(Vcpu {
             vcpu,
             id,
-            saved_state: None,
             #[cfg(target_arch = "x86_64")]
             vendor: cpu_vendor,
         })
@@ -596,12 +594,6 @@ impl Vcpu {
         }
 
         Ok(())
-    }
-
-    /// Gets the saved vCPU state.
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    pub fn get_saved_state(&self) -> Option<CpuState> {
-        self.saved_state.clone()
     }
 
     /// Initializes an aarch64 specific vcpu for booting Linux.
@@ -704,8 +696,6 @@ impl Snapshottable for Vcpu {
             .vcpu
             .state()
             .map_err(|e| MigratableError::Snapshot(anyhow!("Could not get vCPU state {e:?}")))?;
-
-        self.saved_state = Some(saved_state.clone());
 
         Ok(Snapshot::from_data(SnapshotData::new_from_state(
             &saved_state,
@@ -995,7 +985,7 @@ impl CpuManager {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         let x2apic_id = cpu_id;
 
-        let mut vcpu = Vcpu::new(
+        let vcpu = Vcpu::new(
             cpu_id,
             x2apic_id,
             self.vm.as_ref(),
@@ -1025,8 +1015,6 @@ impl CpuManager {
             vcpu.vcpu
                 .set_state(&state)
                 .map_err(|e| Error::VcpuCreate(anyhow!("Could not set the vCPU state {e:?}")))?;
-
-            vcpu.saved_state = Some(state);
         }
 
         let vcpu = Arc::new(Mutex::new(vcpu));
@@ -1701,14 +1689,6 @@ impl CpuManager {
     pub fn get_mpidrs(&self) -> Vec<u64> {
         (0..self.vcpus.len() as u64)
             .map(mpidr_from_vcpu_id)
-            .collect()
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    pub fn get_saved_states(&self) -> Vec<CpuState> {
-        self.vcpus
-            .iter()
-            .map(|cpu| cpu.lock().unwrap().get_saved_state().unwrap())
             .collect()
     }
 

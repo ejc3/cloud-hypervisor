@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
 
-use crate::{CpuState, HypervisorDeviceError, HypervisorVmError};
+use crate::{HypervisorDeviceError, HypervisorVmError};
 
 /// Errors thrown while setting up the VGIC.
 #[derive(Debug, Error)]
@@ -111,9 +111,6 @@ pub trait Vgic: Send + Sync {
 
     /// Returns the MSI reg property of the device
     fn msi_properties(&self) -> [u64; 2];
-
-    /// Get the values of GICR_TYPER for each vCPU.
-    fn set_gicr_typers(&mut self, vcpu_states: &[CpuState]);
 
     /// Downcast the trait object to its concrete type.
     fn as_any_concrete_mut(&mut self) -> &mut dyn Any;
