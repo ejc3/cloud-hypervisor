@@ -500,6 +500,7 @@ mod unit_tests {
     fn test_create_gic() {
         let hv = crate::new().unwrap();
         let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+        let _ = vm.create_vcpu(0, None).unwrap();
 
         KvmGicV3Its::new(&*vm, &create_test_vgic_config()).unwrap();
     }
