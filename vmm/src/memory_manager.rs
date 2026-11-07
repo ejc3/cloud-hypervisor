@@ -953,9 +953,12 @@ impl MemoryManager {
     /// the page cache. KVM's memory slots already point at these host addresses; replacing
     /// the mapping under them is what the MMU notifiers handle.
     ///
-    /// Only private anonymous guest RAM is replaced: shared memory would stop being
-    /// shared with whatever else maps it, and hugetlbfs memory cannot be backed by an
-    /// ordinary file.
+    /// Only private anonymous guest RAM is replaced, checked per region: a region backed by
+    /// a file or memfd (a shared or hugepage zone, a memory file) would be cut off from its
+    /// backing, which later snapshots and vhost-user backends read. The file must hold every
+    /// saved range: a mapping past its end would SIGBUS the guest on first touch, so a short
+    /// file is refused before anything is replaced. Transparent hugepage advice is applied
+    /// again to the new mapping; NUMA bindings are refused by the caller.
     fn map_saved_regions(
         &mut self,
         file_path: &Path,
@@ -973,7 +976,31 @@ impl MemoryManager {
         // SAFETY: FFI call. Trivially safe.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+        let needed: u64 = saved_regions.regions().iter().map(|r| r.length).sum();
+        let have = file.metadata().map_err(Error::SnapshotOpen)?.len();
+        if have < needed {
+            return Err(Error::SnapshotMap(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("the memory file holds {have} bytes, the saved ranges {needed}"),
+            )));
+        }
         let guest_memory = self.guest_memory.memory();
+        // Check every range before replacing any mapping, so a refusal leaves guest RAM as
+        // it was.
+        for range in saved_regions.regions().iter().filter(|r| r.length > 0) {
+            if let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
+                && region.file_offset().is_some()
+            {
+                return Err(Error::SnapshotMap(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "guest RAM at {:#x} is backed by a file or memfd (a shared or hugepage \
+                         zone); memory_restore_mode=map needs private anonymous memory",
+                        range.gpa
+                    ),
+                )));
+            }
+        }
         let mut file_offset: u64 = 0;
         for range in saved_regions.regions() {
             if range.gpa % page_size != 0 || range.length % page_size != 0 {
@@ -1028,6 +1055,12 @@ impl MemoryManager {
             };
             if ret == libc::MAP_FAILED {
                 return Err(Error::SnapshotMap(io::Error::last_os_error()));
+            }
+            if self.thp {
+                // SAFETY: the range was just mapped above and is owned by guest RAM.
+                unsafe {
+                    libc::madvise(ret, range.length as usize, libc::MADV_HUGEPAGE);
+                }
             }
             file_offset += range.length;
         }
@@ -2020,10 +2053,23 @@ impl MemoryManager {
                     &mem_snapshot.memory_ranges,
                     exit_evt,
                 )?,
-                MemoryRestoreMode::Map => mm
-                    .lock()
-                    .unwrap()
-                    .map_saved_regions(&memory_file_path, &mem_snapshot.memory_ranges)?,
+                MemoryRestoreMode::Map => {
+                    // A NUMA binding was applied to the anonymous mapping the restore replaces.
+                    if config
+                        .zones
+                        .iter()
+                        .flatten()
+                        .any(|zone| zone.host_numa_node.is_some())
+                    {
+                        return Err(Error::SnapshotMap(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "memory_restore_mode=map does not keep a memory zone's host_numa_node",
+                        )));
+                    }
+                    mm.lock()
+                        .unwrap()
+                        .map_saved_regions(&memory_file_path, &mem_snapshot.memory_ranges)?
+                }
                 MemoryRestoreMode::Copy => mm
                     .lock()
                     .unwrap()
