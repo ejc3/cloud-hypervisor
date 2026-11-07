@@ -433,6 +433,10 @@ pub enum Error {
     #[error("Error opening snapshot file")]
     SnapshotOpen(#[source] io::Error),
 
+    /// Error mapping the snapshot file over guest memory
+    #[error("Error mapping the snapshot file over guest memory")]
+    SnapshotMap(#[source] io::Error),
+
     /// Error reading from snapshot file
     #[error("Error reading from snapshot file")]
     SnapshotRead(#[source] io::Error),
@@ -937,6 +941,100 @@ impl MemoryManager {
             file_cursor = end;
         }
 
+        Ok(())
+    }
+
+    /// Restore guest memory by mapping the snapshot file privately over it.
+    ///
+    /// Each saved range is mapped `MAP_PRIVATE | MAP_FIXED` from its offset in the
+    /// snapshot file onto the guest RAM that backs it, so the restore reads nothing: the
+    /// guest's first touch of a page reads it from the page cache, and its first write
+    /// makes a private copy. VMs restored from one snapshot share the clean pages through
+    /// the page cache. KVM's memory slots already point at these host addresses; replacing
+    /// the mapping under them is what the MMU notifiers handle.
+    ///
+    /// Only private anonymous guest RAM is replaced: shared memory would stop being
+    /// shared with whatever else maps it, and hugetlbfs memory cannot be backed by an
+    /// ordinary file.
+    fn map_saved_regions(
+        &mut self,
+        file_path: &Path,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+        if self.shared || self.hugepages {
+            return Err(Error::SnapshotMap(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "memory_restore_mode=map needs private memory without hugepages",
+            )));
+        }
+        // SAFETY: FFI call. Trivially safe.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+        let guest_memory = self.guest_memory.memory();
+        let mut file_offset: u64 = 0;
+        for range in saved_regions.regions() {
+            if range.gpa % page_size != 0 || range.length % page_size != 0 {
+                return Err(Error::SnapshotMap(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "range at {:#x} of {:#x} bytes is not page aligned",
+                        range.gpa, range.length
+                    ),
+                )));
+            }
+            if range.length == 0 {
+                continue;
+            }
+            // The whole range must lie in one guest RAM region, so its host addresses are
+            // contiguous.
+            let last = GuestAddress(range.gpa + range.length - 1);
+            let first_region = guest_memory.find_region(GuestAddress(range.gpa));
+            let last_region = guest_memory.find_region(last);
+            match (first_region, last_region) {
+                (Some(a), Some(b)) if a.start_addr() == b.start_addr() => {}
+                _ => {
+                    return Err(Error::SnapshotMap(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "range at {:#x} of {:#x} bytes is not inside one RAM region",
+                            range.gpa, range.length
+                        ),
+                    )));
+                }
+            }
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(range.gpa))
+                .map_err(|_| {
+                    Error::SnapshotMap(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("no host address for guest address {:#x}", range.gpa),
+                    ))
+                })?;
+            // SAFETY: host_addr..host_addr+length is guest RAM this MemoryManager owns
+            // (checked above to be one region); replacing its mapping keeps the range
+            // mapped, readable and writable, so every reference into it stays valid.
+            let ret = unsafe {
+                libc::mmap(
+                    host_addr as *mut libc::c_void,
+                    range.length as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                    file.as_raw_fd(),
+                    file_offset as libc::off_t,
+                )
+            };
+            if ret == libc::MAP_FAILED {
+                return Err(Error::SnapshotMap(io::Error::last_os_error()));
+            }
+            file_offset += range.length;
+        }
+        info!(
+            "Mapped {} saved range(s) of the snapshot file over guest memory",
+            saved_regions.regions().len()
+        );
         Ok(())
     }
 
@@ -1916,16 +2014,20 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
-            if memory_restore_mode == MemoryRestoreMode::OnDemand {
-                mm.lock().unwrap().restore_by_uffd(
+            match memory_restore_mode {
+                MemoryRestoreMode::OnDemand => mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
                     &mem_snapshot.memory_ranges,
                     exit_evt,
-                )?;
-            } else {
-                mm.lock()
+                )?,
+                MemoryRestoreMode::Map => mm
+                    .lock()
                     .unwrap()
-                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+                    .map_saved_regions(&memory_file_path, &mem_snapshot.memory_ranges)?,
+                MemoryRestoreMode::Copy => mm
+                    .lock()
+                    .unwrap()
+                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
             }
 
             Ok(mm)

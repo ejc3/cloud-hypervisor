@@ -2585,6 +2585,11 @@ pub enum MemoryRestoreMode {
     Copy,
     /// Restore lazily by faulting snapshot pages into guest RAM on demand.
     OnDemand,
+    /// Map the snapshot file privately (`MAP_PRIVATE`) over guest RAM: nothing is read
+    /// before resume, a page is read from the page cache when the guest first touches it,
+    /// and VMs restored from one snapshot share every page none of them has written. The
+    /// snapshot file must not change while a VM restored from it runs.
+    Map,
 }
 
 #[derive(Debug, Error)]
@@ -2600,6 +2605,7 @@ impl FromStr for MemoryRestoreMode {
         match s.to_lowercase().as_str() {
             "copy" => Ok(Self::Copy),
             "ondemand" => Ok(Self::OnDemand),
+            "map" => Ok(Self::Map),
             _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
         }
     }
@@ -2620,7 +2626,7 @@ pub struct RestoreConfig {
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|map,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
@@ -4761,6 +4767,16 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
+                net_fds: None,
+                resume: false,
+            }
+        );
+        assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=map")?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode: MemoryRestoreMode::Map,
                 net_fds: None,
                 resume: false,
             }
